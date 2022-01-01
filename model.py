@@ -1,11 +1,9 @@
 # source: https://github.com/rosinality/style-based-gan-pytorch/blob/master/model.py
 
-import torch
+import jittor as jt
+from jittor import nn, Function
+from jittor.nn import init
 
-from torch import nn
-from torch.nn import init
-from torch.nn import functional as F
-from torch.autograd import Function
 
 from math import sqrt
 
@@ -13,14 +11,14 @@ import random
 
 
 def init_linear(linear):
-    init.xavier_normal(linear.weight)
-    linear.bias.data.zero_()
+    init.xavier_gauss_(linear.weight)
+    linear.bias.data.fill(0)
 
 
 def init_conv(conv, glu=True):
-    init.kaiming_normal(conv.weight)
+    init.kaiming_normal_(conv.weight)
     if conv.bias is not None:
-        conv.bias.data.zero_()
+        conv.bias.data.fill(0)
 
 
 class EqualLR:
@@ -29,18 +27,32 @@ class EqualLR:
 
     def compute_weight(self, module):
         weight = getattr(module, self.name + '_orig')
-        fan_in = weight.data.size(1) * weight.data[0][0].numel()
+        fan_in = weight.data.shape[1] * weight.data[0][0].size()
 
         return weight * sqrt(2 / fan_in)
 
     @staticmethod
+
     def apply(module, name):
         fn = EqualLR(name)
 
         weight = getattr(module, name)
-        del module._parameters[name]
-        module.register_parameter(name + '_orig', nn.Parameter(weight.data))
-        module.register_forward_pre_hook(fn)
+
+        # TODO: check if equivalent
+        # del module._parameters[name]
+        # module.register_parameter(name + '_orig', nn.Parameter(weight.data))
+
+        """
+        From Jittor's documentation:
+        The Parameter interface isn't needed in Jittor, this interface does
+          nothings and it is just used for compatible.
+        A Jittor Var is a Parameter when it is a member of Module, if you 
+          don't want a Jittor Var member is treated as a Parameter, just name 
+          it startswith underscore _.
+        """
+        delattr(module, name)
+        setattr(module, name + '_orig', weight)
+        module.register_pre_forward_hook(fn)
 
         return fn
 
@@ -49,6 +61,7 @@ class EqualLR:
         setattr(module, self.name, weight)
 
 
+# TODO: check
 def equal_lr(module, name='weight'):
     EqualLR.apply(module, name)
 
@@ -59,19 +72,19 @@ class FusedUpsample(nn.Module):
     def __init__(self, in_channel, out_channel, kernel_size, padding=0):
         super().__init__()
 
-        weight = torch.randn(in_channel, out_channel, kernel_size, kernel_size)
-        bias = torch.zeros(out_channel)
+        weight = jt.randn((in_channel, out_channel, kernel_size, kernel_size))
+        bias = jt.zeros((out_channel,))
 
         fan_in = in_channel * kernel_size * kernel_size
         self.multiplier = sqrt(2 / fan_in)
 
-        self.weight = nn.Parameter(weight)
-        self.bias = nn.Parameter(bias)
+        self.weight = weight
+        self.bias = bias
 
         self.pad = padding
 
-    def forward(self, input):
-        weight = F.pad(self.weight * self.multiplier, [1, 1, 1, 1])
+    def execute(self, input):
+        weight = nn.pad(self.weight * self.multiplier, [1, 1, 1, 1])
         weight = (
                          weight[:, :, 1:, 1:]
                          + weight[:, :, :-1, 1:]
@@ -79,7 +92,7 @@ class FusedUpsample(nn.Module):
                          + weight[:, :, :-1, :-1]
                  ) / 4
 
-        out = F.conv_transpose2d(input, weight, self.bias, stride=2, padding=self.pad)
+        out = nn.conv_transpose2d(input, weight, self.bias, stride=2, padding=self.pad)
 
         return out
 
@@ -88,19 +101,19 @@ class FusedDownsample(nn.Module):
     def __init__(self, in_channel, out_channel, kernel_size, padding=0):
         super().__init__()
 
-        weight = torch.randn(out_channel, in_channel, kernel_size, kernel_size)
-        bias = torch.zeros(out_channel)
+        weight = jt.randn((out_channel, in_channel, kernel_size, kernel_size))
+        bias = jt.zeros((out_channel,))
 
         fan_in = in_channel * kernel_size * kernel_size
         self.multiplier = sqrt(2 / fan_in)
 
-        self.weight = nn.Parameter(weight)
-        self.bias = nn.Parameter(bias)
+        self.weight = weight
+        self.bias = bias
 
         self.pad = padding
 
-    def forward(self, input):
-        weight = F.pad(self.weight * self.multiplier, [1, 1, 1, 1])
+    def execute(self, input):
+        weight = nn.pad(self.weight * self.multiplier, [1, 1, 1, 1])
         weight = (
                          weight[:, :, 1:, 1:]
                          + weight[:, :, :-1, 1:]
@@ -108,7 +121,7 @@ class FusedDownsample(nn.Module):
                          + weight[:, :, :-1, :-1]
                  ) / 4
 
-        out = F.conv2d(input, weight, self.bias, stride=2, padding=self.pad)
+        out = nn.conv2d(input, weight, self.bias, stride=2, padding=self.pad)
 
         return out
 
@@ -117,26 +130,26 @@ class PixelNorm(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, input):
-        return input / torch.sqrt(torch.mean(input ** 2, dim=1, keepdim=True) + 1e-8)
+    # TODO: check
+    def execute(self, input):
+        return input / jt.sqrt(jt.mean(input ** 2, dim=1, keepdims=True) + 1e-8)
 
 
+# TODO: check validity
 class BlurFunctionBackward(Function):
-    @staticmethod
-    def forward(ctx, grad_output, kernel, kernel_flip):
-        ctx.save_for_backward(kernel, kernel_flip)
+    def execute(self, grad_output, kernel, kernel_flip):
+        self.saved_vars = (kernel, kernel_flip)
 
-        grad_input = F.conv2d(
+        grad_input = nn.conv2d(
             grad_output, kernel_flip, padding=1, groups=grad_output.shape[1]
         )
 
         return grad_input
 
-    @staticmethod
-    def backward(ctx, gradgrad_output):
-        kernel, kernel_flip = ctx.saved_tensors
+    def grad(self, gradgrad_output):
+        kernel, kernel_flip = self.saved_vars
 
-        grad_input = F.conv2d(
+        grad_input = nn.conv2d(
             gradgrad_output, kernel, padding=1, groups=gradgrad_output.shape[1]
         )
 
@@ -144,18 +157,17 @@ class BlurFunctionBackward(Function):
 
 
 class BlurFunction(Function):
-    @staticmethod
-    def forward(ctx, input, kernel, kernel_flip):
-        ctx.save_for_backward(kernel, kernel_flip)
+    def execute(self, input, kernel, kernel_flip):
+        self.saved_vars = (kernel, kernel_flip)
 
-        output = F.conv2d(input, kernel, padding=1, groups=input.shape[1])
+        output = nn.conv2d(input, kernel, padding=1, groups=input.shape[1])
 
         return output
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        kernel, kernel_flip = ctx.saved_tensors
+    def grad(self, grad_output):
+        kernel, kernel_flip = self.saved_vars
 
+        # TODO: check `apply`'s validity
         grad_input = BlurFunctionBackward.apply(grad_output, kernel, kernel_flip)
 
         return grad_input, None, None
@@ -168,16 +180,20 @@ class Blur(nn.Module):
     def __init__(self, channel):
         super().__init__()
 
-        weight = torch.tensor([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=torch.float32)
-        weight = weight.view(1, 1, 3, 3)
+        weight = jt.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype='float32')
+        weight = weight.view((1, 1, 3, 3))
         weight = weight / weight.sum()
-        weight_flip = torch.flip(weight, [2, 3])
+        weight_flip = jt.flip(weight, [2, 3])
 
-        self.register_buffer('weight', weight.repeat(channel, 1, 1, 1))
-        self.register_buffer('weight_flip', weight_flip.repeat(channel, 1, 1, 1))
+        # TODO: check if equivalent
+        # attributes that starts with '_' are not regarded as module parameter
+        self._weight = weight.repeat(channel, 1, 1, 1)
+        self._weight_flip = weight_flip.repeat(channel, 1, 1, 1)
+        # self.register_buffer('weight', weight.repeat(channel, 1, 1, 1))
+        # self.register_buffer('weight_flip', weight_flip.repeat(channel, 1, 1, 1))
 
-    def forward(self, input):
-        return blur(input, self.weight, self.weight_flip)
+    def execute(self, input):
+        return blur(input, self._weight, self._weight_flip)
         # return F.conv2d(input, self.weight, padding=1, groups=input.shape[1])
 
 
@@ -190,7 +206,7 @@ class EqualConv2d(nn.Module):
         conv.bias.data.zero_()
         self.conv = equal_lr(conv)
 
-    def forward(self, input):
+    def execute(self, input):
         return self.conv(input)
 
 
@@ -204,7 +220,7 @@ class EqualLinear(nn.Module):
 
         self.linear = equal_lr(linear)
 
-    def forward(self, input):
+    def execute(self, input):
         return self.linear(input)
 
 
@@ -259,7 +275,7 @@ class ConvBlock(nn.Module):
                 nn.LeakyReLU(0.2),
             )
 
-    def forward(self, input):
+    def execute(self, input):
         out = self.conv1(input)
         out = self.conv2(out)
 
@@ -276,7 +292,7 @@ class AdaptiveInstanceNorm(nn.Module):
         self.style.linear.bias.data[:in_channel] = 1
         self.style.linear.bias.data[in_channel:] = 0
 
-    def forward(self, input, style):
+    def execute(self, input, style):
         style = self.style(style).unsqueeze(2).unsqueeze(3)
         gamma, beta = style.chunk(2, 1)
 
@@ -290,9 +306,9 @@ class NoiseInjection(nn.Module):
     def __init__(self, channel):
         super().__init__()
 
-        self.weight = nn.Parameter(torch.zeros(1, channel, 1, 1))
+        self.weight = jt.zeros((1, channel, 1, 1))
 
-    def forward(self, image, noise):
+    def execute(self, image, noise):
         return image + self.weight * noise
 
 
@@ -300,9 +316,9 @@ class ConstantInput(nn.Module):
     def __init__(self, channel, size=4):
         super().__init__()
 
-        self.input = nn.Parameter(torch.randn(1, channel, size, size))
+        self.input = jt.randn(1, channel, size, size)
 
-    def forward(self, input):
+    def execute(self, input):
         batch = input.shape[0]
         out = self.input.repeat(batch, 1, 1, 1)
 
@@ -359,7 +375,7 @@ class StyledConvBlock(nn.Module):
         self.adain2 = AdaptiveInstanceNorm(out_channel, style_dim)
         self.lrelu2 = nn.LeakyReLU(0.2)
 
-    def forward(self, input, style, noise):
+    def execute(self, input, style, noise):
         out = self.conv1(input)
         out = self.noise1(out, noise)
         out = self.lrelu1(out)
@@ -407,7 +423,7 @@ class Generator(nn.Module):
 
         # self.blur = Blur()
 
-    def forward(self, style, noise, step=0, alpha=-1, mixing_range=(-1, -1)):
+    def execute(self, style, noise, step=0, alpha=-1, mixing_range=(-1, -1)):
         out = noise[0]
 
         if len(style) < 2:
@@ -442,7 +458,7 @@ class Generator(nn.Module):
 
                 if i > 0 and 0 <= alpha < 1:
                     skip_rgb = self.to_rgb[i - 1](out_prev)
-                    skip_rgb = F.interpolate(skip_rgb, scale_factor=2, mode='nearest')
+                    skip_rgb = nn.interpolate(skip_rgb, scale_factor=2, mode='nearest')
                     out = (1 - alpha) * skip_rgb + alpha * out
 
                 break
@@ -463,7 +479,7 @@ class StyledGenerator(nn.Module):
 
         self.style = nn.Sequential(*layers)
 
-    def forward(
+    def execute(
             self,
             input,
             noise=None,
@@ -487,7 +503,7 @@ class StyledGenerator(nn.Module):
 
             for i in range(step + 1):
                 size = 4 * 2 ** i
-                noise.append(torch.randn(batch, 1, size, size, device=input[0].device))
+                noise.append(jt.randn(batch, 1, size, size, device=input[0].device))
 
         if mean_style is not None:
             styles_norm = []
@@ -550,7 +566,7 @@ class Discriminator(nn.Module):
 
         self.linear = EqualLinear(512, 1)
 
-    def forward(self, input, step=0, alpha=-1):
+    def execute(self, input, step=0, alpha=-1):
         for i in range(step, -1, -1):
             index = self.n_layer - i - 1
 
@@ -558,16 +574,16 @@ class Discriminator(nn.Module):
                 out = self.from_rgb[index](input)
 
             if i == 0:
-                out_std = torch.sqrt(out.var(0, unbiased=False) + 1e-8)
+                out_std = jt.sqrt(jt.mean((out - jt.mean(out, dim=0, keepdims=True))**2, dim=0) + 1e-8)
                 mean_std = out_std.mean()
                 mean_std = mean_std.expand(out.size(0), 1, 4, 4)
-                out = torch.cat([out, mean_std], 1)
+                out = jt.concat([out, mean_std], 1)
 
             out = self.progression[index](out)
 
             if i > 0:
                 if i == step and 0 <= alpha < 1:
-                    skip_rgb = F.avg_pool2d(input, 2)
+                    skip_rgb = nn.avg_pool2d(input, 2)
                     skip_rgb = self.from_rgb[index + 1](skip_rgb)
 
                     out = (1 - alpha) * skip_rgb + alpha * out
