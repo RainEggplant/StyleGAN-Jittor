@@ -1,42 +1,39 @@
 import argparse
-import random
 import math
+import random
 
+import jittor as jt
+import jittor.transform as transforms
+from jittor import nn, optim, grad
 from tqdm import tqdm
-import numpy as np
-from PIL import Image
-
-import torch
-from torch import nn, optim
-from torch.nn import functional as F
-from torch.autograd import Variable, grad
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, utils
 
 from dataset import MultiResolutionDataset
 from model import StyledGenerator, Discriminator
 
 
-def requires_grad(model, flag=True):
+# TODO: check
+def requires_grad(model: nn.Module, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
 
-def accumulate(model1, model2, decay=0.999):
+def accumulate(model1: nn.Module, model2: nn.Module, decay=0.999):
     par1 = dict(model1.named_parameters())
     par2 = dict(model2.named_parameters())
 
     for k in par1.keys():
-        par1[k].data.mul_(decay).add_(1 - decay, par2[k].data)
+        # numpy inplace operation
+        par1[k].data *= decay
+        par1[k].data += (1 - decay) * par2[k].data
 
 
 def sample_data(dataset, batch_size, image_size=4):
-    dataset.resolution = image_size
-    loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=1, drop_last=True)
-
+    dataset.set_resolution(image_size)
+    loader = dataset.set_attrs(shuffle=True, batch_size=batch_size, num_workers=1, drop_last=True)
     return loader
 
 
+# TODO: check validity
 def adjust_lr(optimizer, lr):
     for group in optimizer.param_groups:
         mult = group.get('mult', 1)
@@ -49,7 +46,7 @@ def train(args, dataset, generator, discriminator):
     loader = sample_data(
         dataset, args.batch.get(resolution, args.batch_default), resolution
     )
-    data_loader = iter(loader)
+    data_iter = iter(loader)
 
     adjust_lr(g_optimizer, args.lr.get(resolution, 0.001))
     adjust_lr(d_optimizer, args.lr.get(resolution, 0.001))
@@ -70,7 +67,7 @@ def train(args, dataset, generator, discriminator):
     final_progress = False
 
     for i in pbar:
-        discriminator.zero_grad()
+        d_optimizer.zero_grad()
 
         alpha = min(1, 1 / args.phase * (used_sample + 1))
 
@@ -95,9 +92,9 @@ def train(args, dataset, generator, discriminator):
             loader = sample_data(
                 dataset, args.batch.get(resolution, args.batch_default), resolution
             )
-            data_loader = iter(loader)
+            data_iter = iter(loader)
 
-            torch.save(
+            jt.save(
                 {
                     'generator': generator.module.state_dict(),
                     'discriminator': discriminator.module.state_dict(),
@@ -112,50 +109,45 @@ def train(args, dataset, generator, discriminator):
             adjust_lr(d_optimizer, args.lr.get(resolution, 0.001))
 
         try:
-            real_image = next(data_loader)
+            real_image = next(data_iter)
 
         except (OSError, StopIteration):
-            data_loader = iter(loader)
-            real_image = next(data_loader)
+            data_iter = iter(loader)
+            real_image = next(data_iter)
 
         used_sample += real_image.shape[0]
 
         b_size = real_image.size(0)
-        real_image = real_image.cuda()
 
         if args.loss == 'wgan-gp':
             real_predict = discriminator(real_image, step=step, alpha=alpha)
             real_predict = real_predict.mean() - 0.001 * (real_predict ** 2).mean()
-            (-real_predict).backward()
+
+            d_optimizer.backward(-real_predict)
 
         elif args.loss == 'r1':
             real_image.requires_grad = True
             real_scores = discriminator(real_image, step=step, alpha=alpha)
-            real_predict = F.softplus(-real_scores).mean()
-            real_predict.backward(retain_graph=True)
+            real_predict = nn.softplus(-real_scores).mean()
+            d_optimizer.backward(real_predict)
 
-            grad_real = grad(
-                outputs=real_scores.sum(), inputs=real_image, create_graph=True
-            )[0]
+            grad_real = grad(real_scores.sum(), real_image)
             grad_penalty = (
-                grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
+                    grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
             ).mean()
             grad_penalty = 10 / 2 * grad_penalty
-            grad_penalty.backward()
-            if i%10 == 0:
+            d_optimizer.backward(grad_penalty)
+            if i % 10 == 0:
                 grad_loss_val = grad_penalty.item()
 
         if args.mixing and random.random() < 0.9:
-            gen_in11, gen_in12, gen_in21, gen_in22 = torch.randn(
-                4, b_size, code_size, device='cuda'
-            ).chunk(4, 0)
+            gen_in11, gen_in12, gen_in21, gen_in22 = jt.randn(
+                (4, b_size, code_size)).chunk(4, 0)
             gen_in1 = [gen_in11.squeeze(0), gen_in12.squeeze(0)]
             gen_in2 = [gen_in21.squeeze(0), gen_in22.squeeze(0)]
 
         else:
-            gen_in1, gen_in2 = torch.randn(2, b_size, code_size, device='cuda').chunk(
-                2, 0
-            )
+            gen_in1, gen_in2 = jt.randn((2, b_size, code_size)).chunk(2, 0)
             gen_in1 = gen_in1.squeeze(0)
             gen_in2 = gen_in2.squeeze(0)
 
@@ -164,34 +156,32 @@ def train(args, dataset, generator, discriminator):
 
         if args.loss == 'wgan-gp':
             fake_predict = fake_predict.mean()
-            fake_predict.backward()
+            d_optimizer.backward(fake_predict)
 
-            eps = torch.rand(b_size, 1, 1, 1).cuda()
+            eps = jt.rand((b_size, 1, 1, 1))
             x_hat = eps * real_image.data + (1 - eps) * fake_image.data
             x_hat.requires_grad = True
             hat_predict = discriminator(x_hat, step=step, alpha=alpha)
-            grad_x_hat = grad(
-                outputs=hat_predict.sum(), inputs=x_hat, create_graph=True
-            )[0]
+            grad_x_hat = grad(hat_predict.sum(), x_hat)
             grad_penalty = (
-                (grad_x_hat.view(grad_x_hat.size(0), -1).norm(2, dim=1) - 1) ** 2
+                    (grad_x_hat.view(grad_x_hat.size(0), -1).norm(2, dim=1) - 1) ** 2
             ).mean()
             grad_penalty = 10 * grad_penalty
-            grad_penalty.backward()
-            if i%10 == 0:
+            d_optimizer.backward(grad_penalty)
+            if i % 10 == 0:
                 grad_loss_val = grad_penalty.item()
                 disc_loss_val = (-real_predict + fake_predict).item()
 
         elif args.loss == 'r1':
-            fake_predict = F.softplus(fake_predict).mean()
-            fake_predict.backward()
-            if i%10 == 0:
+            fake_predict = nn.softplus(fake_predict).mean()
+            d_optimizer.backward(fake_predict)
+            if i % 10 == 0:
                 disc_loss_val = (real_predict + fake_predict).item()
 
         d_optimizer.step()
 
         if (i + 1) % n_critic == 0:
-            generator.zero_grad()
+            g_optimizer.zero_grad()
 
             requires_grad(generator, True)
             requires_grad(discriminator, False)
@@ -204,14 +194,14 @@ def train(args, dataset, generator, discriminator):
                 loss = -predict.mean()
 
             elif args.loss == 'r1':
-                loss = F.softplus(-predict).mean()
+                loss = nn.softplus(-predict).mean()
 
-            if i%10 == 0:
+            if i % 10 == 0:
                 gen_loss_val = loss.item()
 
-            loss.backward()
+            g_optimizer.backward(loss)
             g_optimizer.step()
-            accumulate(g_running, generator.module)
+            accumulate(g_running, generator)
 
             requires_grad(generator, False)
             requires_grad(discriminator, True)
@@ -221,25 +211,25 @@ def train(args, dataset, generator, discriminator):
 
             gen_i, gen_j = args.gen_sample.get(resolution, (10, 5))
 
-            with torch.no_grad():
+            with jt.no_grad():
                 for _ in range(gen_i):
                     images.append(
                         g_running(
-                            torch.randn(gen_j, code_size).cuda(), step=step, alpha=alpha
-                        ).data.cpu()
+                            jt.randn((gen_j, code_size)), step=step, alpha=alpha
+                        ).data
                     )
 
-            utils.save_image(
-                torch.cat(images, 0),
-                f'sample/{str(i + 1).zfill(6)}.png',
+            jt.save_image(
+                jt.concat(images, 0),
+                f'sample/{i + 1:06}.png',
                 nrow=gen_i,
                 normalize=True,
                 range=(-1, 1),
             )
 
         if (i + 1) % 10000 == 0:
-            torch.save(
-                g_running.state_dict(), f'checkpoint/{str(i + 1).zfill(6)}.model'
+            jt.save(
+                g_running.state_dict(), f'checkpoint/{i + 1:06}.model'
             )
 
         state_msg = (
@@ -289,32 +279,31 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    generator = nn.DataParallel(StyledGenerator(code_size)).cuda()
-    discriminator = nn.DataParallel(
-        Discriminator(from_rgb_activate=not args.no_from_rgb_activate)
-    ).cuda()
-    g_running = StyledGenerator(code_size).cuda()
-    g_running.train(False)
+    generator = StyledGenerator(code_size)
+    discriminator = Discriminator(from_rgb_activate=True)
+
+    g_running = StyledGenerator(code_size)
+    g_running.eval()
 
     g_optimizer = optim.Adam(
-        generator.module.generator.parameters(), lr=args.lr, betas=(0.0, 0.99)
+        generator.generator.parameters(), lr=args.lr, betas=(0.0, 0.99)
     )
     g_optimizer.add_param_group(
         {
-            'params': generator.module.style.parameters(),
+            'params': generator.style.parameters(),
             'lr': args.lr * 0.01,
             'mult': 0.01,
         }
     )
     d_optimizer = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(0.0, 0.99))
 
-    accumulate(g_running, generator.module, 0)
+    accumulate(g_running, generator, 0)
 
     if args.ckpt is not None:
-        ckpt = torch.load(args.ckpt)
+        ckpt = jt.load(args.ckpt)
 
-        generator.module.load_state_dict(ckpt['generator'])
-        discriminator.module.load_state_dict(ckpt['discriminator'])
+        generator.load_state_dict(ckpt['generator'])
+        discriminator.load_state_dict(ckpt['discriminator'])
         g_running.load_state_dict(ckpt['g_running'])
         g_optimizer.load_state_dict(ckpt['g_optimizer'])
         d_optimizer.load_state_dict(ckpt['d_optimizer'])
@@ -323,7 +312,7 @@ if __name__ == '__main__':
         [
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+            transforms.ImageNormalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
 
