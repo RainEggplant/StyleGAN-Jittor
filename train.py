@@ -1,6 +1,7 @@
 import argparse
 import math
 import random
+from pathlib import Path
 
 import jittor as jt
 import jittor.transform as transforms
@@ -9,9 +10,9 @@ from tqdm import tqdm
 
 from dataset import MultiResolutionDataset
 from model import StyledGenerator, Discriminator
+# jt.flags.log_silent = True
 
 
-# TODO: check
 def requires_grad(model: nn.Module, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
@@ -22,14 +23,16 @@ def accumulate(model1: nn.Module, model2: nn.Module, decay=0.999):
     par2 = dict(model2.named_parameters())
 
     for k in par1.keys():
-        # numpy inplace operation
-        par1[k].data *= decay
-        par1[k].data += (1 - decay) * par2[k].data
+        # # numpy inplace operation
+        # par1[k].data *= decay
+        # par1[k].data += (1 - decay) * par2[k].data
+        par1[k].update(par1[k] * decay + (1 - decay) * par2[k].detach())
 
 
-def sample_data(dataset, batch_size, image_size=4):
-    dataset.set_resolution(image_size)
-    loader = dataset.set_attrs(shuffle=True, batch_size=batch_size, num_workers=1, drop_last=True)
+def sample_data(root, transform, batch_size, image_size=4):
+    res_root = Path(root, str(image_size))
+    dataset = MultiResolutionDataset(root, transform, resolution=image_size)
+    loader = dataset.set_attrs(shuffle=True, batch_size=batch_size, num_workers=args.n_workers, drop_last=True)
     return loader
 
 
@@ -40,18 +43,52 @@ def adjust_lr(optimizer, lr):
         group['lr'] = lr * mult
 
 
-def train(args, dataset, generator, discriminator):
+def sample_and_save(generator, step, alpha, latent, n_row, n_col, bs, save_name):
+    n_iter = n_row * n_col // bs
+    results = []
+    for i_s in range(n_iter):
+        results.append(generator(latent[i_s * bs:(i_s + 1) * bs], step=step, alpha=alpha).data)
+    n_left = n_row * n_col - n_iter * bs
+    if n_left > 0:
+        results.append(generator(latent[-n_left:], step=step, alpha=alpha).data)
+
+    jt.save_image(
+        jt.concat(results, 0),
+        save_name,
+        nrow=n_row,
+        normalize=True,
+        range=(-1, 1),
+    )
+
+
+class SynchronizedOpFix:
+    """
+    Temporary fix of Jittor's bug.
+    See https://github.com/Jittor/jittor/issues/197
+    """
+    def __enter__(self):
+        if jt.in_mpi:
+            jt.sync_all()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if jt.in_mpi:
+            jt.sync_all()
+
+
+def train(args, transform, generator, discriminator):
     step = int(math.log2(args.init_size)) - 2
     resolution = 4 * 2 ** step
     loader = sample_data(
-        dataset, args.batch.get(resolution, args.batch_default), resolution
+        args.path, transform, args.batch.get(resolution, args.batch_default), resolution
     )
     data_iter = iter(loader)
 
     adjust_lr(g_optimizer, args.lr.get(resolution, 0.001))
     adjust_lr(d_optimizer, args.lr.get(resolution, 0.001))
 
-    pbar = tqdm(range(3_000_000))
+    pbar = range(3_000_000)
+    if jt.rank == 0:
+        pbar = tqdm(pbar, dynamic_ncols=True)
 
     requires_grad(generator, False)
     requires_grad(discriminator, True)
@@ -61,13 +98,25 @@ def train(args, dataset, generator, discriminator):
     grad_loss_val = 0
 
     alpha = 0
-    used_sample = 0
+    used_sample = jt.array(0)
 
     max_step = int(math.log2(args.max_size)) - 2
     final_progress = False
 
+    if jt.rank == 0:
+        # fix sample latent code
+        gen_i, gen_j = args.gen_sample.get(resolution, (10, 5))
+        sample_z = jt.randn((gen_i * gen_j, code_size))
+        sample_dir = Path(args.save_dir, 'sample')
+        checkpoint_dir = Path(args.save_dir, 'checkpoint')
+        (sample_dir / 'random').mkdir(parents=True, exist_ok=True)
+        (sample_dir / 'fixed').mkdir(parents=True, exist_ok=True)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     for i in pbar:
-        d_optimizer.zero_grad()
+        if jt.in_mpi:
+            used_sample.sync()
+            jt.sync_all()
 
         alpha = min(1, 1 / args.phase * (used_sample + 1))
 
@@ -75,7 +124,7 @@ def train(args, dataset, generator, discriminator):
             alpha = 1
 
         if used_sample > args.phase * 2:
-            used_sample = 0
+            used_sample = jt.array(0)
             step += 1
 
             if step > max_step:
@@ -89,24 +138,33 @@ def train(args, dataset, generator, discriminator):
 
             resolution = 4 * 2 ** step
 
-            loader = sample_data(
-                dataset, args.batch.get(resolution, args.batch_default), resolution
-            )
+            batch_size = args.batch.get(resolution, args.batch_default)
+            with SynchronizedOpFix():
+                loader.terminate()
+                loader = sample_data(
+                    args.path, transform, batch_size, resolution
+                )
+
             data_iter = iter(loader)
+            learning_rate = args.lr.get(resolution, 0.001)
 
-            jt.save(
-                {
-                    'generator': generator.module.state_dict(),
-                    'discriminator': discriminator.module.state_dict(),
-                    'g_optimizer': g_optimizer.state_dict(),
-                    'd_optimizer': d_optimizer.state_dict(),
-                    'g_running': g_running.state_dict(),
-                },
-                f'checkpoint/train_step-{ckpt_step}.model',
-            )
+            if jt.rank == 0:
+                print('\nsaving model...')
+                jt.save(
+                    {
+                        'generator': generator.state_dict(),
+                        'discriminator': discriminator.state_dict(),
+                        'g_optimizer': g_optimizer.state_dict(),
+                        'd_optimizer': d_optimizer.state_dict(),
+                        'g_running': g_running.state_dict(),
+                    },
+                    checkpoint_dir / f'train_step-{ckpt_step}.model'
+                )
+                print(f'\nAdvancing from step {step} ==> {step + 1}: '
+                      f'resolution {resolution}, batch size {batch_size}, lr {learning_rate:.3}')
 
-            adjust_lr(g_optimizer, args.lr.get(resolution, 0.001))
-            adjust_lr(d_optimizer, args.lr.get(resolution, 0.001))
+            adjust_lr(g_optimizer, learning_rate)
+            adjust_lr(d_optimizer, learning_rate)
 
         try:
             real_image = next(data_iter)
@@ -115,30 +173,30 @@ def train(args, dataset, generator, discriminator):
             data_iter = iter(loader)
             real_image = next(data_iter)
 
-        used_sample += real_image.shape[0]
+        used_sample += real_image.shape[0] * jt.world_size
 
         b_size = real_image.size(0)
 
+        d_loss = 0
         if args.loss == 'wgan-gp':
             real_predict = discriminator(real_image, step=step, alpha=alpha)
             real_predict = real_predict.mean() - 0.001 * (real_predict ** 2).mean()
-
-            d_optimizer.backward(-real_predict)
+            d_loss += -real_predict
 
         elif args.loss == 'r1':
             real_image.requires_grad = True
             real_scores = discriminator(real_image, step=step, alpha=alpha)
             real_predict = nn.softplus(-real_scores).mean()
-            d_optimizer.backward(real_predict)
+            d_loss += real_predict
 
             grad_real = grad(real_scores.sum(), real_image)
             grad_penalty = (
                     grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
             ).mean()
             grad_penalty = 10 / 2 * grad_penalty
-            d_optimizer.backward(grad_penalty)
+            d_loss += grad_penalty
             if i % 10 == 0:
-                grad_loss_val = grad_penalty.item()
+                grad_loss_val = grad_penalty
 
         if args.mixing and random.random() < 0.9:
             gen_in11, gen_in12, gen_in21, gen_in22 = jt.randn(
@@ -156,7 +214,7 @@ def train(args, dataset, generator, discriminator):
 
         if args.loss == 'wgan-gp':
             fake_predict = fake_predict.mean()
-            d_optimizer.backward(fake_predict)
+            d_loss += fake_predict
 
             eps = jt.rand((b_size, 1, 1, 1))
             x_hat = eps * real_image.data + (1 - eps) * fake_image.data
@@ -167,22 +225,21 @@ def train(args, dataset, generator, discriminator):
                     (grad_x_hat.view(grad_x_hat.size(0), -1).norm(2, dim=1) - 1) ** 2
             ).mean()
             grad_penalty = 10 * grad_penalty
-            d_optimizer.backward(grad_penalty)
+            d_loss += grad_penalty
             if i % 10 == 0:
-                grad_loss_val = grad_penalty.item()
-                disc_loss_val = (-real_predict + fake_predict).item()
+                grad_loss_val = grad_penalty
+                disc_loss_val = (-real_predict + fake_predict)
 
         elif args.loss == 'r1':
             fake_predict = nn.softplus(fake_predict).mean()
-            d_optimizer.backward(fake_predict)
+            d_loss += fake_predict
             if i % 10 == 0:
-                disc_loss_val = (real_predict + fake_predict).item()
+                disc_loss_val = (real_predict + fake_predict)
 
-        d_optimizer.step()
+        with SynchronizedOpFix():
+            d_optimizer.step(d_loss)
 
         if (i + 1) % n_critic == 0:
-            g_optimizer.zero_grad()
-
             requires_grad(generator, True)
             requires_grad(discriminator, False)
 
@@ -197,47 +254,42 @@ def train(args, dataset, generator, discriminator):
                 loss = nn.softplus(-predict).mean()
 
             if i % 10 == 0:
-                gen_loss_val = loss.item()
+                gen_loss_val = loss
 
-            g_optimizer.backward(loss)
-            g_optimizer.step()
+            with SynchronizedOpFix():
+                g_optimizer.step(loss)
+
             accumulate(g_running, generator)
 
             requires_grad(generator, False)
             requires_grad(discriminator, True)
 
-        if (i + 1) % 100 == 0:
-            images = []
-
-            gen_i, gen_j = args.gen_sample.get(resolution, (10, 5))
-
+        if (i + 1) % 100 == 0 and jt.rank == 0:
+            sample_batch = real_image.shape[0]
             with jt.no_grad():
-                for _ in range(gen_i):
-                    images.append(
-                        g_running(
-                            jt.randn((gen_j, code_size)), step=step, alpha=alpha
-                        ).data
-                    )
+                sample_and_save(g_running, step, alpha, jt.randn(gen_i * gen_j, code_size),
+                                gen_i, gen_j, sample_batch, sample_dir / f'random/{i + 1:06}.png')
+                sample_and_save(g_running, step, alpha, sample_z,
+                                gen_i, gen_j, sample_batch, sample_dir / f'fixed/{i + 1:06}.png')
 
-            jt.save_image(
-                jt.concat(images, 0),
-                f'sample/{i + 1:06}.png',
-                nrow=gen_i,
-                normalize=True,
-                range=(-1, 1),
-            )
-
-        if (i + 1) % 10000 == 0:
+        if (i + 1) % 10000 == 0 and jt.rank == 0:
+            print('\nsaving inference model...')
             jt.save(
-                g_running.state_dict(), f'checkpoint/{i + 1:06}.model'
+                g_running.state_dict(), checkpoint_dir / f'{i + 1:06}.model'
             )
 
-        state_msg = (
-            f'Size: {4 * 2 ** step}; G: {gen_loss_val:.3f}; D: {disc_loss_val:.3f};'
-            f' Grad: {grad_loss_val:.3f}; Alpha: {alpha:.5f}'
-        )
+        # will cause dead lock. I don't know how to solve this, so just use data in rank 0
+        # if jt.in_mpi:
+        #     gen_loss_val = gen_loss_val.mpi_all_reduce()
+        #     disc_loss_val = disc_loss_val.mpi_all_reduce()
+        #     grad_loss_val = grad_loss_val.mpi_all_reduce()
 
-        pbar.set_description(state_msg)
+        if jt.rank == 0:
+            state_msg = (
+                f'Size: {4 * 2 ** step}; G: {gen_loss_val.item():.3f}; D: {disc_loss_val.item():.3f};'
+                f' Grad: {grad_loss_val.item():.3f}; Alpha: {alpha:.5f}'
+            )
+            pbar.set_description(state_msg)
 
 
 if __name__ == '__main__':
@@ -248,6 +300,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Progressive Growing of GANs')
 
     parser.add_argument('path', type=str, help='path of specified dataset')
+    parser.add_argument(
+        '--n_workers', type=int, default=16, help="batch sizes for each gpus"
+    )
     parser.add_argument(
         '--phase',
         type=int,
@@ -276,9 +331,12 @@ if __name__ == '__main__':
         choices=['wgan-gp', 'r1'],
         help='class of gan loss',
     )
+    parser.add_argument('--save_dir', type=str, default='saved')
+    parser.add_argument('--cpu', action='store_true')
 
     args = parser.parse_args()
 
+    jt.flags.use_cuda = 0 if args.cpu else 1
     generator = StyledGenerator(code_size)
     discriminator = Discriminator(from_rgb_activate=True)
 
@@ -316,8 +374,6 @@ if __name__ == '__main__':
         ]
     )
 
-    dataset = MultiResolutionDataset(args.path, transform)
-
     if args.sched:
         args.lr = {128: 0.0015, 256: 0.002, 512: 0.003, 1024: 0.003}
         args.batch = {4: 512, 8: 256, 16: 128, 32: 64, 64: 32, 128: 32, 256: 32}
@@ -330,4 +386,4 @@ if __name__ == '__main__':
 
     args.batch_default = 32
 
-    train(args, dataset, generator, discriminator)
+    train(args, transform, generator, discriminator)

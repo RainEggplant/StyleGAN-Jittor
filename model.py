@@ -1,13 +1,9 @@
-# source: https://github.com/rosinality/style-based-gan-pytorch/blob/master/model.py
+import random
+from math import sqrt
 
 import jittor as jt
 from jittor import nn, Function
 from jittor.nn import init
-
-
-from math import sqrt
-
-import random
 
 
 def init_linear(linear):
@@ -27,20 +23,15 @@ class EqualLR:
 
     def compute_weight(self, module):
         weight = getattr(module, self.name + '_orig')
-        fan_in = weight.data.shape[1] * weight.data[0][0].size()
+        fan_in = weight[0].numel()
 
         return weight * sqrt(2 / fan_in)
 
     @staticmethod
-
     def apply(module, name):
         fn = EqualLR(name)
 
         weight = getattr(module, name)
-
-        # TODO: check if equivalent
-        # del module._parameters[name]
-        # module.register_parameter(name + '_orig', nn.Parameter(weight.data))
 
         """
         From Jittor's documentation:
@@ -61,7 +52,6 @@ class EqualLR:
         setattr(module, self.name, weight)
 
 
-# TODO: check
 def equal_lr(module, name='weight'):
     EqualLR.apply(module, name)
 
@@ -71,16 +61,11 @@ def equal_lr(module, name='weight'):
 class FusedUpsample(nn.Module):
     def __init__(self, in_channel, out_channel, kernel_size, padding=0):
         super().__init__()
-
-        weight = jt.randn((in_channel, out_channel, kernel_size, kernel_size))
-        bias = jt.zeros((out_channel,))
+        self.weight = jt.randn((in_channel, out_channel, kernel_size, kernel_size))
+        self.bias = jt.zeros((out_channel,))
 
         fan_in = in_channel * kernel_size * kernel_size
         self.multiplier = sqrt(2 / fan_in)
-
-        self.weight = weight
-        self.bias = bias
-
         self.pad = padding
 
     def execute(self, input):
@@ -101,15 +86,11 @@ class FusedDownsample(nn.Module):
     def __init__(self, in_channel, out_channel, kernel_size, padding=0):
         super().__init__()
 
-        weight = jt.randn((out_channel, in_channel, kernel_size, kernel_size))
-        bias = jt.zeros((out_channel,))
+        self.weight = jt.randn((out_channel, in_channel, kernel_size, kernel_size))
+        self.bias = jt.zeros((out_channel,))
 
         fan_in = in_channel * kernel_size * kernel_size
         self.multiplier = sqrt(2 / fan_in)
-
-        self.weight = weight
-        self.bias = bias
-
         self.pad = padding
 
     def execute(self, input):
@@ -130,12 +111,10 @@ class PixelNorm(nn.Module):
     def __init__(self):
         super().__init__()
 
-    # TODO: check
     def execute(self, input):
         return input / jt.sqrt(jt.mean(input ** 2, dim=1, keepdims=True) + 1e-8)
 
 
-# TODO: check validity
 class BlurFunctionBackward(Function):
     def execute(self, grad_output, kernel, kernel_flip):
         self.saved_vars = (kernel, kernel_flip)
@@ -167,7 +146,6 @@ class BlurFunction(Function):
     def grad(self, grad_output):
         kernel, kernel_flip = self.saved_vars
 
-        # TODO: check `apply`'s validity
         grad_input = BlurFunctionBackward.apply(grad_output, kernel, kernel_flip)
 
         return grad_input, None, None
@@ -185,16 +163,13 @@ class Blur(nn.Module):
         weight = weight / weight.sum()
         weight_flip = jt.flip(weight, [2, 3])
 
-        # TODO: check if equivalent
         # attributes that starts with '_' are not regarded as module parameter
         self._weight = weight.repeat(channel, 1, 1, 1)
         self._weight_flip = weight_flip.repeat(channel, 1, 1, 1)
-        # self.register_buffer('weight', weight.repeat(channel, 1, 1, 1))
-        # self.register_buffer('weight_flip', weight_flip.repeat(channel, 1, 1, 1))
 
     def execute(self, input):
         return blur(input, self._weight, self._weight_flip)
-        # return F.conv2d(input, self.weight, padding=1, groups=input.shape[1])
+        # return nn.conv2d(input, self._weight, padding=1, groups=input.shape[1])
 
 
 class EqualConv2d(nn.Module):
@@ -202,8 +177,8 @@ class EqualConv2d(nn.Module):
         super().__init__()
 
         conv = nn.Conv2d(*args, **kwargs)
-        conv.weight.data.normal_()
-        conv.bias.data.zero_()
+        conv.weight.gauss_()
+        conv.bias.zero_()
         self.conv = equal_lr(conv)
 
     def execute(self, input):
@@ -215,8 +190,8 @@ class EqualLinear(nn.Module):
         super().__init__()
 
         linear = nn.Linear(in_dim, out_dim)
-        linear.weight.data.normal_()
-        linear.bias.data.zero_()
+        linear.weight.gauss_()
+        linear.bias.zero_()
 
         self.linear = equal_lr(linear)
 
@@ -503,7 +478,7 @@ class StyledGenerator(nn.Module):
 
             for i in range(step + 1):
                 size = 4 * 2 ** i
-                noise.append(jt.randn(batch, 1, size, size, device=input[0].device))
+                noise.append(jt.randn(batch, 1, size, size))
 
         if mean_style is not None:
             styles_norm = []
@@ -574,7 +549,7 @@ class Discriminator(nn.Module):
                 out = self.from_rgb[index](input)
 
             if i == 0:
-                out_std = jt.sqrt(jt.mean((out - jt.mean(out, dim=0, keepdims=True))**2, dim=0) + 1e-8)
+                out_std = jt.sqrt(jt.mean((out - jt.mean(out, dim=0, keepdims=True)) ** 2, dim=0) + 1e-8)
                 mean_std = out_std.mean()
                 mean_std = mean_std.expand(out.size(0), 1, 4, 4)
                 out = jt.concat([out, mean_std], 1)
