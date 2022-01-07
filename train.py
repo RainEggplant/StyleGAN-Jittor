@@ -332,7 +332,7 @@ if __name__ == '__main__':
         help='class of gan loss',
     )
     parser.add_argument('--save_dir', type=str, default='saved')
-    parser.add_argument('--cpu', action='store_true')
+    parser.add_argument('--cpu', action='store_true', help='use CPU only')
 
     args = parser.parse_args()
 

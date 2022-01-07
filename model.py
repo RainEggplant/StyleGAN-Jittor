@@ -491,7 +491,7 @@ class StyledGenerator(nn.Module):
         return self.generator(styles, noise, step, alpha, mixing_range=mixing_range)
 
     def mean_style(self, input):
-        style = self.style(input).mean(0, keepdim=True)
+        style = self.style(input).mean(0, keepdims=True)
 
         return style
 
