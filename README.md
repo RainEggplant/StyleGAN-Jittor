@@ -6,6 +6,10 @@ Adapted from the [PyTorch version](https://github.com/rosinality/style-based-gan
 
 ## Training
 
+Running `prepare_data.py` is not necessary. It will resize your images before training, rather than resizing while training. Using resized images requires you to modify `sample_data` function in `train.py` to use the `FolderDataset`.
+
+To train your model, run `train.py`:
+
 ```
 usage: train.py [-h] [--n_workers N_WORKERS] [--phase PHASE] [--lr LR]
                 [--sched] [--init_size INIT_SIZE] [--max_size MAX_SIZE]
@@ -45,6 +49,8 @@ mpirun -np 4 python train.py --mixing --max_size 128 --sched --loss r1 --save_di
 
 ## Sampling
 
+To sample results from checkpoints, run `sample.py`:
+
 ```
 usage: generate.py [-h] [--size SIZE] [--n_row N_ROW] [--n_col N_COL] [--cpu]
                    path
@@ -59,3 +65,11 @@ optional arguments:
   --n_col N_COL  number of columns of sample matrix
   --cpu          use CPU only
 ```
+
+## Results
+
+Here we show some results sampled from our trained 128x128 FFHQ model. I only trained 270k iters so it has not converged yet.
+
+![sample](assets/sample.png)
+
+![sample_mixing](assets/sample_mixing_0.png)

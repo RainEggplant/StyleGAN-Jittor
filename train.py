@@ -10,7 +10,6 @@ from tqdm import tqdm
 
 from dataset import MultiResolutionDataset
 from model import StyledGenerator, Discriminator
-# jt.flags.log_silent = True
 
 
 def requires_grad(model: nn.Module, flag=True):
@@ -23,14 +22,10 @@ def accumulate(model1: nn.Module, model2: nn.Module, decay=0.999):
     par2 = dict(model2.named_parameters())
 
     for k in par1.keys():
-        # # numpy inplace operation
-        # par1[k].data *= decay
-        # par1[k].data += (1 - decay) * par2[k].data
         par1[k].update(par1[k] * decay + (1 - decay) * par2[k].detach())
 
 
 def sample_data(root, transform, batch_size, image_size=4):
-    res_root = Path(root, str(image_size))
     dataset = MultiResolutionDataset(root, transform, resolution=image_size)
     loader = dataset.set_attrs(shuffle=True, batch_size=batch_size, num_workers=args.n_workers, drop_last=True)
     return loader
